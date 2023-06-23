@@ -1,0 +1,158 @@
+# Copyright 2021 The OpenSSL Project Authors. All Rights Reserved.
+#
+# Licensed under the Apache License 2.0 (the "License").  You may not use
+# this file except in compliance with the License.  You can obtain a copy
+# in the file LICENSE in the source distribution or at
+# https://www.openssl.org/source/license.html
+
+name: GH Release Static
+
+on:
+  push:
+    tags:
+      - "*"
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # This has to be a separate job, it seems, because we want to use a
+  # container for it.
+  unix-container:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['alpine:edge', 'alpine:latest']
+        cc: ['gcc', 'clang']
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+    - name: install packages
+      run: |
+        apk --no-cache add build-base perl linux-headers git ${{ matrix.cc }}
+
+    - uses: actions/checkout@v3
+
+    - name: config
+      run: |
+        cc="${{ matrix.cc }}"
+
+        extra_cflags=""
+        if [[ ${cc} == "clang" ]] ; then
+          # https://www.openwall.com/lists/musl/2022/02/16/14
+          extra_cflags="-Wno-sign-compare"
+        fi
+
+        CC=${{ matrix.cc }} ./config --banner=Configured no-shared \
+            -Wall -Werror enable-fips enable-quic --strict-warnings -DOPENSSL_USE_IPV6=0 ${extra_cflags}
+
+    - name: config dump
+      run: ./configdata.pm --dump
+    - name: make
+      run: make -s -j4
+    - name: make test
+      run: make test HARNESS_JOBS=${HARNESS_JOBS:-4}
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [
+          macos-11,
+          macos-12,
+          macos-13,
+          ubuntu-20.04,
+          ubuntu-22.04,
+        ]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v3
+    - name: checkout fuzz/corpora submodule
+      run: git submodule update --init --depth 1 fuzz/corpora
+    - name: config
+      id: config
+      run: |
+        OUTPUT_DIR="${GITHUB_WORKSPACE}/dist/"
+        CC=${{ matrix.zoo.cc }} ./config --banner=Configured \
+            --prefix="${OUTPUT_DIR}" --openssldir="${OUTPUT_DIR}/etc/ssl" \
+            -Wall -Werror --strict-warnings enable-fips enable-quic
+    - name: config dump
+      run: ./configdata.pm --dump
+    - name: make
+      run: make -s -j4
+    - name: make test
+      run: make test HARNESS_JOBS=${HARNESS_JOBS:-4}
+    - name: Archive Linux
+      run: |
+        # compile release file
+        cd "${{ steps.config.outputs.OUTPUT_DIR }}"
+        zip -r "${{ matrix.os }}.zip" .      
+    - name: Release Linux
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fail_on_unmatched_files: false
+        generate_release_notes: true
+        files: |
+          ${{ steps.config.outputs.OUTPUT_DIR }}/${{ matrix.os }}.zip
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [
+          windows-2019,
+          windows-2022
+        ]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v3
+    - name: checkout fuzz/corpora submodule
+      run: git submodule update --init --depth 1 fuzz/corpora
+    - uses: ilammy/msvc-dev-cmd@v1
+    - uses: ilammy/setup-nasm@v1
+    - uses: shogo82148/actions-setup-perl@v1
+    - name: prepare the build directory
+      run: mkdir _build
+    - name: config
+      id: config
+      working-directory: _build
+      run: |
+        OUTPUT_DIR="${GITHUB_WORKSPACE}/dist/"
+        perl ..\Configure --prefix="${OUTPUT_DIR}" --openssldir="${OUTPUT_DIR}/etc/ssl" --banner=Configured no-makedepend enable-fips enable-quic 
+    - name: config dump
+      working-directory: _build
+      run: ./configdata.pm --dump
+    - name: build
+      working-directory: _build
+      run: nmake /S
+    - name: test
+      working-directory: _build
+      run: nmake test VERBOSE_FAILURE=yes HARNESS_JOBS=4
+    - name: Archive Linux
+      run: |
+        # compile release file
+        cd "${{ steps.config.outputs.OUTPUT_DIR }}"
+        zip -r "${{ matrix.os }}.zip" .      
+    - name: Release Linux
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fail_on_unmatched_files: false
+        generate_release_notes: true
+        files: |
+          ${{ steps.config.outputs.OUTPUT_DIR }}/${{ matrix.os }}.zip
